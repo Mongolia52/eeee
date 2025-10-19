@@ -7,6 +7,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TextService = game:GetService("TextService")
+local TweenService = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -219,7 +220,7 @@ function Library:OnUnload(cb) self.OnUnload = cb end
 
 -- Basic window factory (simple)
 function Library:CreateWindow(title, size, position)
-    size = size or UDim2.new(0, 600, 0, 400)
+    size = size or UDim2.new(0, 860, 0, 520)
     position = position or UDim2.new(0.5, -size.X.Offset/2, 0.5, -size.Y.Offset/2)
 
     local main = self:Create("Frame", {
@@ -232,98 +233,250 @@ function Library:CreateWindow(title, size, position)
     })
     self:AddToRegistry(main, { BackgroundColor3 = "MainColor", BorderColor3 = "AccentColor" })
 
+    -- Header
     local header = self:Create("Frame", {
-        Name = "Header",
         Parent = main,
-        Size = UDim2.new(1,0,0,36),
-        Position = UDim2.new(0,0,0,0),
+        Size = UDim2.new(1,0,0,42),
         BackgroundTransparency = 1,
     })
     local titleLabel = self:CreateLabel({
         Parent = header,
-        Position = UDim2.fromOffset(10,8),
-        Size = UDim2.fromOffset(400,20),
+        Position = UDim2.fromOffset(12,10),
+        Size = UDim2.fromOffset(480,22),
         Text = title or "Window",
         TextXAlignment = Enum.TextXAlignment.Left,
         TextSize = 18,
     })
-
-    self:MakeDraggable(header, 36)
-    -- container for content
-    local content = self:Create("Frame", {
+    -- Accent line under header
+    local headerLine = self:Create("Frame", {
         Parent = main,
-        Position = UDim2.new(0,0,0,36),
-        Size = UDim2.new(1,0,1,-36),
-        BackgroundTransparency = 1,
+        BackgroundColor3 = self.AccentColor,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1,0,0,2),
+        Position = UDim2.new(0,0,0,42),
     })
-    return {
+    self:AddToRegistry(headerLine, { BackgroundColor3 = "AccentColor" })
+    self:MakeDraggable(header, 42)
+
+    -- Tab bar
+    local tabBar = self:Create("Frame", {
+        Parent = main,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -24, 0, 32),
+        Position = UDim2.new(0, 12, 0, 46),
+    })
+    local tabLayout = Instance.new("UIListLayout")
+    tabLayout.FillDirection = Enum.FillDirection.Horizontal
+    tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    tabLayout.Padding = UDim.new(0, 8)
+    tabLayout.Parent = tabBar
+
+    -- Pages container (below tab bar)
+    local pagesContainer = self:Create("Frame", {
+        Parent = main,
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 12, 0, 82),
+        Size = UDim2.new(1, -24, 1, -94),
+    })
+
+    local WindowApi = {
         Main = main,
         Header = header,
-        Content = content,
-        AddLeftGroupbox = function(_, name)
-            local box = Library:Create("Frame", {
-                Parent = content,
-                BackgroundColor3 = Library.MainColor,
-                BorderColor3 = Library.OutlineColor,
-                Size = UDim2.new(0.5, -8, 1, 0),
-                Position = UDim2.new(0,8,0,8),
-            })
-            Library:AddToRegistry(box, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
-            local lbl = Library:CreateLabel({
-                Parent = box,
-                Position = UDim2.new(0,8,0,8),
-                Size = UDim2.new(1,-16,0,24),
-                Text = name or "",
-                TextSize = 16,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            return {
-                Frame = box,
-                AddLabel = function(_, text) 
-                    local L = Library:CreateLabel({ Parent = box, Text = text, Position = UDim2.new(0,8,0,30), Size = UDim2.new(1,-16,0,22) })
-                    return {
-                        AddColorPicker = function(_, id, info)
-                            -- placeholder: ThemeManager will provide UI wiring later
-                            return nil
-                        end
-                    }
-                end,
-                AddDivider = function() end,
-                AddButton = function(_, params)
-                    params = type(params) == "table" and params or {Text = params}
-                    local btn = Library:Create("TextButton", {
-                        Parent = box,
-                        Size = UDim2.new(1,-16,0,30),
-                        Position = UDim2.fromOffset(8, 60 + (#box:GetChildren() * 34)),
-                        Text = params.Text or "Button",
-                        Font = Library.Font,
-                        TextSize = 14,
-                        BackgroundColor3 = Library.AccentColor,
-                    })
-                    Library:AddToRegistry(btn, { BackgroundColor3 = "AccentColor", TextColor3 = "FontColor" })
-                    btn.MouseButton1Click:Connect(function()
-                        Library:SafeCallback(params.Func)
-                    end)
-                    return btn
-                end
-            }
-        end,
-        AddRightGroupbox = function(_, name)
-            local box = Library:Create("Frame", {
-                Parent = content,
-                BackgroundColor3 = Library.MainColor,
-                BorderColor3 = Library.OutlineColor,
-                Size = UDim2.new(0.5, -8, 1, 0),
-                Position = UDim2.new(0.5, 8, 0, 8),
-            })
-            Library:AddToRegistry(box, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
-            return {
-                Frame = box,
-                AddDropdown = function() end,
-                AddInput = function() end
-            }
-        end
+        TabBar = tabBar,
+        Pages = pagesContainer,
+        _tabs = {},
+        _active = nil,
     }
+
+    -- helper: make a page’s two columns with auto vertical stacking
+    local function makeColumns(parent)
+        local page = Library:Create("Frame", {
+            Parent = parent,
+            BackgroundTransparency = 1,
+            Size = UDim2.fromScale(1,1),
+            Visible = false,
+        })
+
+        local left = Library:Create("Frame", {
+            Parent = page,
+            BackgroundColor3 = Library.BackgroundColor,
+            BorderColor3 = Library.OutlineColor,
+            Size = UDim2.new(0.5, -6, 1, 0),
+            Position = UDim2.new(0, 0, 0, 0),
+        })
+        Library:AddToRegistry(left, { BackgroundColor3 = "BackgroundColor", BorderColor3 = "OutlineColor" })
+
+        local right = Library:Create("Frame", {
+            Parent = page,
+            BackgroundColor3 = Library.BackgroundColor,
+            BorderColor3 = Library.OutlineColor,
+            Size = UDim2.new(0.5, -6, 1, 0),
+            Position = UDim2.new(0.5, 6, 0, 0),
+        })
+        Library:AddToRegistry(right, { BackgroundColor3 = "BackgroundColor", BorderColor3 = "OutlineColor" })
+
+        -- layouts + padding for clean stacking
+        local function addStack(frame)
+            local pad = Instance.new("UIPadding")
+            pad.PaddingTop = UDim.new(0, 10)
+            pad.PaddingBottom = UDim.new(0, 10)
+            pad.PaddingLeft = UDim.new(0, 10)
+            pad.PaddingRight = UDim.new(0, 10)
+            pad.Parent = frame
+
+            local list = Instance.new("UIListLayout")
+            list.FillDirection = Enum.FillDirection.Vertical
+            list.SortOrder = Enum.SortOrder.LayoutOrder
+            list.Padding = UDim.new(0, 8)
+            list.Parent = frame
+        end
+        addStack(left)
+        addStack(right)
+
+        -- API for groupboxes inside this page
+        local PageApi = {
+            Frame = page,
+            AddLeftGroupbox = function(_, name)
+                local box = Library:Create("Frame", {
+                    Parent = left,
+                    BackgroundColor3 = Library.MainColor,
+                    BorderColor3 = Library.OutlineColor,
+                    Size = UDim2.new(1, 0, 0, 120), -- height grows with content (AutomaticSize)
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    LayoutOrder = #left:GetChildren() + 1,
+                })
+                Library:AddToRegistry(box, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
+
+                local pad = Instance.new("UIPadding")
+                pad.PaddingTop = UDim.new(0, 10)
+                pad.PaddingBottom = UDim.new(0, 10)
+                pad.PaddingLeft = UDim.new(0, 10)
+                pad.PaddingRight = UDim.new(0, 10)
+                pad.Parent = box
+
+                local titleLbl = Library:CreateLabel({
+                    Parent = box,
+                    Size = UDim2.new(1, -4, 0, 20),
+                    Text = tostring(name or ""),
+                    TextSize = 15,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    LayoutOrder = 1,
+                })
+
+                local list = Instance.new("UIListLayout")
+                list.FillDirection = Enum.FillDirection.Vertical
+                list.SortOrder = Enum.SortOrder.LayoutOrder
+                list.Padding = UDim.new(0, 6)
+                list.Parent = box
+
+                return { Frame = box }
+            end,
+            AddRightGroupbox = function(_, name)
+                local box = Library:Create("Frame", {
+                    Parent = right,
+                    BackgroundColor3 = Library.MainColor,
+                    BorderColor3 = Library.OutlineColor,
+                    Size = UDim2.new(1, 0, 0, 120),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    LayoutOrder = #right:GetChildren() + 1,
+                })
+                Library:AddToRegistry(box, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
+
+                local pad = Instance.new("UIPadding")
+                pad.PaddingTop = UDim.new(0, 10)
+                pad.PaddingBottom = UDim.new(0, 10)
+                pad.PaddingLeft = UDim.new(0, 10)
+                pad.PaddingRight = UDim.new(0, 10)
+                pad.Parent = box
+
+                local titleLbl = Library:CreateLabel({
+                    Parent = box,
+                    Size = UDim2.new(1, -4, 0, 20),
+                    Text = tostring(name or ""),
+                    TextSize = 15,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    LayoutOrder = 1,
+                })
+
+                local list = Instance.new("UIListLayout")
+                list.FillDirection = Enum.FillDirection.Vertical
+                list.SortOrder = Enum.SortOrder.LayoutOrder
+                list.Padding = UDim.new(0, 6)
+                list.Parent = box
+
+                return { Frame = box }
+            end,
+        }
+
+        return PageApi
+    end
+
+    -- create a new tab
+    function WindowApi:AddTab(tabName)
+        tabName = tostring(tabName or "Tab")
+        local page = makeColumns(pagesContainer)
+
+        -- tab button
+        local btn = Library:Create("TextButton", {
+            Parent = tabBar,
+            Size = UDim2.fromOffset(120, 28),
+            Text = tabName,
+            Font = Library.Font,
+            TextSize = 15,
+            BackgroundColor3 = Library.MainColor,
+            BorderColor3 = Library.OutlineColor,
+        })
+        Library:AddToRegistry(btn, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor", TextColor3 = "FontColor" })
+
+        -- indicator line under active tab
+        local under = Library:Create("Frame", {
+            Parent = btn,
+            BackgroundColor3 = Library.AccentColor,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1,0,0,2),
+            Position = UDim2.new(0,0,1,-2),
+            Visible = false,
+        })
+        Library:AddToRegistry(under, { BackgroundColor3 = "AccentColor" })
+
+        local TabApi = {
+            Name = tabName,
+            Button = btn,
+            Underline = under,
+            Page = page,
+        }
+        table.insert(WindowApi._tabs, TabApi)
+
+        local function activateTab(t)
+            if WindowApi._active == t then return end
+            -- hide old
+            if WindowApi._active then
+                WindowApi._active.Underline.Visible = false
+                local oldPage = WindowApi._active.Page.Frame
+                -- fade out
+                TweenService:Create(oldPage, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = 1 }):Play()
+                task.delay(0.12, function() oldPage.Visible = false end)
+            end
+            -- show new
+            t.Underline.Visible = true
+            local newPage = t.Page.Frame
+            newPage.BackgroundTransparency = 1
+            newPage.Visible = true
+            TweenService:Create(newPage, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = 1 }):Play()
+            WindowApi._active = t
+        end
+
+        btn.MouseButton1Click:Connect(function() activateTab(TabApi) end)
+
+        -- make first tab active
+        if not WindowApi._active then
+            activateTab(TabApi)
+        end
+
+        return page
+    end
+
+    return WindowApi
 end
 
 -- Component: Toggle
@@ -772,6 +925,12 @@ do
 end
 
 Library.ThemeManager = ThemeManager
+
+task.defer(function()
+    if Library and Library.ThemeManager then
+        Library.ThemeManager:ApplyTheme("BBot")
+    end
+end)
 
 -- SaveManager (kept)
 local SaveManager = {}
