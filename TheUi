@@ -1,0 +1,971 @@
+-- Cleaned UI Framework
+-- Keeps: Library (UI core), ThemeManager, SaveManager, UI components (buttons, toggles, sliders, dropdowns, colorpicker, keybinds, inputs)
+-- Removed: Game-specific hooks, ESP, executor-only wrappers, external modules
+
+-- Basic services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TextService = game:GetService("TextService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ScreenGui setup
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "CleanUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.DisplayOrder = 2147483647
+-- parent to PlayerGui for maximum compatibility
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Library table
+local Library = {
+    Registry = {},
+    RegistryMap = {},
+    HudRegistry = {},
+    Signals = {},
+    ScreenGui = ScreenGui,
+    OpenedFrames = {},
+    Font = Enum.Font.SourceSans,
+    FontColor = Color3.fromRGB(245,225,200),
+    MainColor = Color3.fromRGB(15,15,15),
+    BackgroundColor = Color3.fromRGB(13,13,13),
+    AccentColor = Color3.fromRGB(255,140,0),
+    OutlineColor = Color3.fromRGB(40,20,0),
+    RiskColor = Color3.fromRGB(255,36,36),
+    Black = Color3.new(0,0,0),
+    SaveManager = nil,
+    ThemeManager = nil,
+    NotifyOnError = true,
+}
+
+-- Basic helpers
+local function safePcall(f, ...)
+    local ok, res = pcall(f, ...)
+    return ok, res
+end
+
+function Library:SafeCallback(f, ...)
+    if not f then return end
+    if not self.NotifyOnError then
+        return f(...)
+    end
+    local ok, err = safePcall(f, ...)
+    if not ok then
+        local msg = tostring(err)
+        warn("Library callback error:", msg)
+    end
+end
+
+function Library:Create(Class, props)
+    local inst = Instance.new(Class)
+    if props then
+        for k,v in pairs(props) do
+            -- protect read-only errors
+            local ok, _ = pcall(function() inst[k] = v end)
+            if not ok then
+                -- ignore
+            end
+        end
+    end
+    return inst
+end
+
+function Library:CreateLabel(props)
+    local label = self:Create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = self.Font,
+        TextColor3 = self.FontColor,
+        TextSize = 16,
+        TextStrokeTransparency = 1,
+        TextWrapped = false,
+    })
+    for k,v in pairs(props or {}) do
+        pcall(function() label[k] = v end)
+    end
+    self:AddToRegistry(label, { TextColor3 = "FontColor" })
+    return label
+end
+
+function Library:AddToRegistry(instance, properties, isHud)
+    local idx = #self.Registry + 1
+    local data = { Instance = instance, Properties = properties, Idx = idx }
+    table.insert(self.Registry, data)
+    self.RegistryMap[instance] = data
+    if isHud then
+        table.insert(self.HudRegistry, data)
+    end
+end
+
+function Library:RemoveFromRegistry(instance)
+    local data = self.RegistryMap[instance]
+    if not data then return end
+    for i=#self.Registry,1,-1 do
+        if self.Registry[i] == data then table.remove(self.Registry, i) end
+    end
+    for i=#self.HudRegistry,1,-1 do
+        if self.HudRegistry[i] == data then table.remove(self.HudRegistry, i) end
+    end
+    self.RegistryMap[instance] = nil
+end
+
+function Library:UpdateColorsUsingRegistry()
+    for _, obj in ipairs(self.Registry) do
+        for prop, colorIdx in pairs(obj.Properties) do
+            if type(colorIdx) == "string" then
+                local col = self[colorIdx]
+                if col ~= nil then
+                    pcall(function() obj.Instance[prop] = col end)
+                end
+            elseif type(colorIdx) == "function" then
+                local ok, res = pcall(colorIdx)
+                if ok then pcall(function() obj.Instance[prop] = res end) end
+            end
+        end
+    end
+end
+
+-- simple notification function (replace with fancy popups as needed)
+function Library:Notify(text, time)
+    time = time or 2
+    print("[Library Notify] "..tostring(text))
+    -- optionally: create a small UI notification element
+end
+
+-- Utility color functions
+function Library:GetDarkerColor(col)
+    local h,s,v = Color3.toHSV(col)
+    return Color3.fromHSV(h, s, math.clamp(v/2.5, 0, 1))
+end
+function Library:GetLighterColor(col)
+    local h,s,v = Color3.toHSV(col)
+    v = math.clamp(v * 1.5, 0, 1)
+    return Color3.fromHSV(h, s, v)
+end
+
+Library.AccentColorDark = Library:GetDarkerColor(Library.AccentColor)
+Library.AccentColorLight = Library:GetLighterColor(Library.AccentColor)
+Library.FontColorDark = Library:GetDarkerColor(Library.FontColor)
+Library.MainColorLight = Library:GetLighterColor(Library.MainColor)
+
+-- Text bounds helper
+function Library:GetTextBounds(text, font, size, resolution)
+    resolution = resolution or Vector2.new(workspace.CurrentCamera.ViewportSize.X, workspace.CurrentCamera.ViewportSize.Y)
+    local bounds = TextService:GetTextSize(tostring(text), size, font, resolution)
+    return bounds.X, bounds.Y
+end
+
+-- Dragging helper
+function Library:MakeDraggable(instance, cutoff)
+    instance.Active = true
+    local mouseDown = false
+    local startPos = nil
+    local startGuiPos = nil
+
+    instance.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            local mouse = UserInputService:GetMouseLocation()
+            -- convert to instance relative
+            local objX = mouse.X - instance.AbsolutePosition.X
+            local objY = mouse.Y - instance.AbsolutePosition.Y
+            if objY > (cutoff or 40) then return end
+            mouseDown = true
+            startPos = Vector2.new(mouse.X, mouse.Y)
+            startGuiPos = instance.Position
+            while mouseDown and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                local cur = UserInputService:GetMouseLocation()
+                local delta = cur - startPos
+                instance.Position = UDim2.new(0, startGuiPos.X.Offset + delta.X, 0, startGuiPos.Y.Offset + delta.Y)
+                RunService.RenderStepped:Wait()
+            end
+        end
+    end)
+    instance.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            mouseDown = false
+        end
+    end)
+end
+
+-- Opened frames guard (for tooltips and color pickers)
+function Library:MouseIsOverOpenedFrame()
+    local mouse = UserInputService:GetMouseLocation()
+    for frame,_ in pairs(self.OpenedFrames) do
+        local pos = frame.AbsolutePosition
+        local size = frame.AbsoluteSize
+        if mouse.X >= pos.X and mouse.X <= pos.X + size.X and mouse.Y >= pos.Y and mouse.Y <= pos.Y + size.Y then
+            return true
+        end
+    end
+    return false
+end
+
+-- Signal management
+function Library:GiveSignal(signal)
+    table.insert(self.Signals, signal)
+end
+function Library:AddSignal(signal)
+    table.insert(self.Signals, signal)
+    return signal
+end
+function Library:Unload()
+    for i = #self.Signals, 1, -1 do
+        local s = table.remove(self.Signals, i)
+        local suc = pcall(function() s:Disconnect() end)
+    end
+    pcall(function() ScreenGui:Destroy() end)
+end
+function Library:OnUnload(cb) self.OnUnload = cb end
+
+-- Basic window factory (simple)
+function Library:CreateWindow(title, size, position)
+    size = size or UDim2.new(0, 600, 0, 400)
+    position = position or UDim2.new(0.5, -size.X.Offset/2, 0.5, -size.Y.Offset/2)
+
+    local main = self:Create("Frame", {
+        Name = title or "Window",
+        Parent = self.ScreenGui,
+        BackgroundColor3 = self.MainColor,
+        BorderColor3 = self.AccentColor,
+        Size = size,
+        Position = position,
+    })
+    self:AddToRegistry(main, { BackgroundColor3 = "MainColor", BorderColor3 = "AccentColor" })
+
+    local header = self:Create("Frame", {
+        Name = "Header",
+        Parent = main,
+        Size = UDim2.new(1,0,0,36),
+        Position = UDim2.new(0,0,0,0),
+        BackgroundTransparency = 1,
+    })
+    local titleLabel = self:CreateLabel({
+        Parent = header,
+        Position = UDim2.fromOffset(10,8),
+        Size = UDim2.fromOffset(400,20),
+        Text = title or "Window",
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextSize = 18,
+    })
+
+    self:MakeDraggable(header, 36)
+    -- container for content
+    local content = self:Create("Frame", {
+        Parent = main,
+        Position = UDim2.new(0,0,0,36),
+        Size = UDim2.new(1,0,1,-36),
+        BackgroundTransparency = 1,
+    })
+    return {
+        Main = main,
+        Header = header,
+        Content = content,
+        AddLeftGroupbox = function(_, name)
+            local box = Library:Create("Frame", {
+                Parent = content,
+                BackgroundColor3 = Library.MainColor,
+                BorderColor3 = Library.OutlineColor,
+                Size = UDim2.new(0.5, -8, 1, 0),
+                Position = UDim2.new(0,8,0,8),
+            })
+            Library:AddToRegistry(box, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
+            local lbl = Library:CreateLabel({
+                Parent = box,
+                Position = UDim2.new(0,8,0,8),
+                Size = UDim2.new(1,-16,0,24),
+                Text = name or "",
+                TextSize = 16,
+                TextXAlignment = Enum.TextXAlignment.Left
+            })
+            return {
+                Frame = box,
+                AddLabel = function(_, text) 
+                    local L = Library:CreateLabel({ Parent = box, Text = text, Position = UDim2.new(0,8,0,30), Size = UDim2.new(1,-16,0,22) })
+                    return {
+                        AddColorPicker = function(_, id, info)
+                            -- placeholder: ThemeManager will provide UI wiring later
+                            return nil
+                        end
+                    }
+                end,
+                AddDivider = function() end,
+                AddButton = function(_, params)
+                    params = type(params) == "table" and params or {Text = params}
+                    local btn = Library:Create("TextButton", {
+                        Parent = box,
+                        Size = UDim2.new(1,-16,0,30),
+                        Position = UDim2.fromOffset(8, 60 + (#box:GetChildren() * 34)),
+                        Text = params.Text or "Button",
+                        Font = Library.Font,
+                        TextSize = 14,
+                        BackgroundColor3 = Library.AccentColor,
+                    })
+                    Library:AddToRegistry(btn, { BackgroundColor3 = "AccentColor", TextColor3 = "FontColor" })
+                    btn.MouseButton1Click:Connect(function()
+                        Library:SafeCallback(params.Func)
+                    end)
+                    return btn
+                end
+            }
+        end,
+        AddRightGroupbox = function(_, name)
+            local box = Library:Create("Frame", {
+                Parent = content,
+                BackgroundColor3 = Library.MainColor,
+                BorderColor3 = Library.OutlineColor,
+                Size = UDim2.new(0.5, -8, 1, 0),
+                Position = UDim2.new(0.5, 8, 0, 8),
+            })
+            Library:AddToRegistry(box, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
+            return {
+                Frame = box,
+                AddDropdown = function() end,
+                AddInput = function() end
+            }
+        end
+    }
+end
+
+-- Component: Toggle
+local Toggles = {}
+local Options = {}
+local Flags = setmetatable({}, {
+    __index = function(self, key)
+        if Toggles[key] ~= nil then
+            return Toggles[key].Value
+        elseif Options[key] ~= nil then
+            local ok, data = pcall(function() return Options[key]:GetState() end)
+            if ok then return data end
+            return Options[key].Value
+        end
+    end
+})
+Library.Toggles = Toggles
+Library.Options = Options
+Library.Flags = Flags
+
+function Library:CreateToggle(parentFrame, id, info)
+    -- parentFrame is a frame to parent to; id is index in Options
+    local container = self:Create("Frame", {
+        Parent = parentFrame,
+        Size = UDim2.new(1, -16, 0, 28),
+        BackgroundTransparency = 1,
+    })
+    local label = self:CreateLabel({
+        Parent = container,
+        Position = UDim2.fromOffset(8, 4),
+        Size = UDim2.fromOffset(300, 20),
+        Text = info.Text or id,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    })
+    local toggleBtn = self:Create("TextButton", {
+        Parent = container,
+        Size = UDim2.fromOffset(36, 20),
+        Position = UDim2.new(1, -48, 0, 4),
+        Text = "",
+        BackgroundColor3 = Color3.fromRGB(60,60,60)
+    })
+    self:AddToRegistry(toggleBtn, { BackgroundColor3 = "MainColor" })
+
+    local obj = {
+        Value = info.Default or false,
+        Type = "Toggle",
+        SetValue = function(self, val)
+            self.Value = not not val
+            -- update visuals
+            pcall(function()
+                if self.Value then
+                    toggleBtn.BackgroundColor3 = Library.AccentColor
+                else
+                    toggleBtn.BackgroundColor3 = Color3.fromRGB(60,60,60)
+                end
+            end)
+            Library:SafeCallback(self.Callback, self.Value)
+            if Library.SaveManager then Library.SaveManager:AttemptSave() end
+        end,
+        OnChanged = function(self, cb)
+            self.Callback = cb
+        end
+    }
+    Toggles[id] = obj
+    obj:SetValue(obj.Value)
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        obj:SetValue(not obj.Value)
+    end)
+
+    return obj
+end
+
+-- Component: Slider (simple implementation)
+function Library:CreateSlider(parentFrame, id, info)
+    local min = info.Min or 0
+    local max = info.Max or 100
+    local step = info.Step or 1
+    local default = info.Default or min
+
+    local frame = self:Create("Frame", {
+        Parent = parentFrame,
+        Size = UDim2.new(1, -16, 0, 36),
+        BackgroundTransparency = 1,
+    })
+    local label = self:CreateLabel({ Parent = frame, Position = UDim2.fromOffset(8, 2), Size = UDim2.fromOffset(300, 18), Text = info.Text or id, TextSize = 14 })
+    local bar = self:Create("Frame", { Parent = frame, Position = UDim2.fromOffset(8, 20), Size = UDim2.new(1, -32, 0, 10), BackgroundColor3 = Library.OutlineColor })
+    local fill = self:Create("Frame", { Parent = bar, Position = UDim2.new(0,0,0,0), Size = UDim2.new(0,0,1,0), BackgroundColor3 = Library.AccentColor })
+
+    local slider = {
+        Value = default,
+        Type = "Slider",
+        SetValue = function(self, val)
+            val = math.clamp(val, min, max)
+            val = math.floor((val - min) / step + 0.5) * step + min
+            self.Value = val
+            local pct = (val - min) / (max - min)
+            fill.Size = UDim2.new(pct, 0, 1, 0)
+            Library:SafeCallback(self.Callback, self.Value)
+            if Library.SaveManager then Library.SaveManager:AttemptSave() end
+        end,
+        OnChanged = function(self, cb)
+            self.Callback = cb
+        end,
+        GetState = function(self) return self.Value end
+    }
+    Options[id] = slider
+    slider:SetValue(default)
+
+    local dragging = false
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            while dragging and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+                local minX = bar.AbsolutePosition.X
+                local maxX = minX + bar.AbsoluteSize.X
+                local mouseX = math.clamp(UserInputService:GetMouseLocation().X, minX, maxX)
+                local pct = (mouseX - minX) / (maxX - minX)
+                local val = min + pct * (max - min)
+                slider:SetValue(val)
+                RunService.RenderStepped:Wait()
+            end
+        end
+    end)
+    bar.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+
+    return slider
+end
+
+-- Component: Dropdown (basic)
+function Library:CreateDropdown(parentFrame, id, info)
+    local values = info.Values or {}
+    local default = info.Default
+    local label = self:CreateLabel({ Parent = parentFrame, Position = UDim2.fromOffset(8, 4), Size = UDim2.fromOffset(300,20), Text = info.Text or id })
+    local btn = self:Create("TextButton", { Parent = parentFrame, Position = UDim2.fromOffset(8, 28), Size = UDim2.fromOffset(200,24), Text = tostring(default or "Select") })
+    local listFrame = self:Create("Frame", { Parent = self.ScreenGui, Visible = false, Size = UDim2.fromOffset(160, 20 + (#values * 20)), Position = UDim2.fromOffset(100, 100) })
+    self:AddToRegistry(listFrame, { BackgroundColor3 = "BackgroundColor", BorderColor3 = "OutlineColor" })
+
+    local optionObj = {
+        Value = default,
+        Type = "Dropdown",
+        SetValue = function(self, val)
+            self.Value = val
+            btn.Text = tostring(val)
+            Library:SafeCallback(self.Callback, val)
+            if Library.SaveManager then Library.SaveManager:AttemptSave() end
+        end,
+        OnChanged = function(self, cb) self.Callback = cb end,
+        GetState = function(self) return self.Value end
+    }
+    Options[id] = optionObj
+
+    local function updateListPosition()
+        listFrame.Position = UDim2.fromOffset(btn.AbsolutePosition.X, btn.AbsolutePosition.Y + btn.AbsoluteSize.Y + 4)
+    end
+    btn.MouseButton1Click:Connect(function()
+        listFrame.Visible = not listFrame.Visible
+        updateListPosition()
+        Library.OpenedFrames[listFrame] = listFrame.Visible or nil
+    end)
+
+    for i, val in ipairs(values) do
+        local t = self:Create("TextButton", { Parent = listFrame, Position = UDim2.fromOffset(0, 20*(i-1)), Size = UDim2.fromOffset(listFrame.Size.X.Offset, 20), Text = tostring(val), TextXAlignment = Enum.TextXAlignment.Left })
+        t.MouseButton1Click:Connect(function()
+            optionObj:SetValue(val)
+            listFrame.Visible = false
+            Library.OpenedFrames[listFrame] = nil
+        end)
+    end
+
+    return optionObj
+end
+
+-- Component: Input box
+function Library:CreateInput(parentFrame, id, info)
+    local box = self:Create("TextBox", {
+        Parent = parentFrame,
+        Size = UDim2.fromOffset(200, 24),
+        Position = UDim2.fromOffset(8, 8),
+        Text = info.Default or "",
+        ClearTextOnFocus = false,
+        Font = self.Font,
+        TextSize = 14
+    })
+    Options[id] = {
+        Value = box.Text,
+        Type = "Input",
+        SetValue = function(self, v) box.Text = tostring(v); self.Value = tostring(v); if Library.SaveManager then Library.SaveManager:AttemptSave() end end,
+        GetState = function(self) return box.Text end
+    }
+    box.FocusLost:Connect(function(enter)
+        Options[id].Value = box.Text
+        Library:SafeCallback(info.OnChanged, box.Text)
+    end)
+    return Options[id]
+end
+
+-- Component: ColorPicker (compact implementation)
+do
+    local function createColorPickerUI(title, default)
+        local display = Library:Create("Frame", { Parent = Library.ScreenGui, Size = UDim2.fromOffset(18, 14), BackgroundColor3 = default or Color3.new(1,1,1) })
+        Library:AddToRegistry(display, { BackgroundColor3 = "MainColor" })
+        local popup = Library:Create("Frame", { Parent = Library.ScreenGui, Visible = false, Size = UDim2.fromOffset(240, 260), BackgroundColor3 = Library.BackgroundColor, BorderColor3 = Library.OutlineColor })
+        Library:AddToRegistry(popup, { BackgroundColor3 = "BackgroundColor", BorderColor3 = "OutlineColor" })
+        local titleLbl = Library:CreateLabel({ Parent = popup, Position = UDim2.fromOffset(6,6), Size = UDim2.fromOffset(200, 18), Text = title or "Color" })
+        -- Simplified version: we will provide Hue + Sat/Vib map using images if desired; for now allow hex textbox + RGB.
+        local hexBox = Library:Create("TextBox", { Parent = popup, Position = UDim2.fromOffset(8, 220), Size = UDim2.fromOffset(220, 26), Text = "#FFFFFF", ClearTextOnFocus = false })
+        return display, popup, hexBox
+    end
+
+    function Library:CreateColorPicker(parentFrame, id, info)
+        local default = info.Default or Color3.new(1,1,1)
+        local display, popup, hexBox = createColorPickerUI(info.Text or id, default)
+
+        display.Parent = parentFrame
+
+        local cp = {
+            Value = default,
+            Transparency = 0,
+            Type = "ColorPicker",
+            SetValueRGB = function(self, color, transparency)
+                self.Value = color
+                self.Transparency = transparency or 0
+                display.BackgroundColor3 = color
+                if Library.SaveManager then Library.SaveManager:AttemptSave() end
+                Library:SafeCallback(self.Callback, color)
+            end,
+            OnChanged = function(self, cb) self.Callback = cb; cb(self.Value) end,
+            GetState = function(self) return {self.Value, self.Transparency} end
+        }
+        Options[id] = cp
+
+        display.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                popup.Visible = not popup.Visible
+                Library.OpenedFrames[popup] = popup.Visible or nil
+                -- position popup nearby
+                popup.Position = UDim2.fromOffset(display.AbsolutePosition.X, display.AbsolutePosition.Y + display.AbsoluteSize.Y + 4)
+            end
+        end)
+
+        hexBox.FocusLost:Connect(function(enter)
+            local txt = hexBox.Text
+            local success, r,g,b = pcall(function()
+                txt = txt:gsub("#","")
+                local num = tonumber(txt,16)
+                if not num then return nil end
+                r = math.floor(num / 0x10000) % 0x100
+                g = math.floor(num / 0x100) % 0x100
+                b = num % 0x100
+                return r,g,b
+            end)
+            if success and r then
+                local col = Color3.fromRGB(r,g,b)
+                cp:SetValueRGB(col)
+            end
+        end)
+
+        return cp
+    end
+end
+
+-- KeyPicker / KeyBind (basic)
+function Library:CreateKeyPicker(parentFrame, id, info)
+    local label = self:CreateLabel({ Parent = parentFrame, Position = UDim2.fromOffset(8,4), Size = UDim2.fromOffset(300,20), Text = info.Text or id })
+    local box = self:Create("TextButton", { Parent = parentFrame, Position = UDim2.fromOffset(8,28), Size = UDim2.fromOffset(120,24), Text = "None" })
+    local obj = { Value = info.Default or "None", Mode = info.Mode or "Toggle", Type = "KeyPicker" }
+
+    obj.SetValue = function(self, val)
+        self.Value = val
+        box.Text = tostring(val)
+        if Library.SaveManager then Library.SaveManager:AttemptSave() end
+    end
+    obj.GetState = function(self) return self.Value end
+    obj.OnPress = function(self, cb) self._cb = cb end
+
+    box.MouseButton1Click:Connect(function()
+        box.Text = "..."
+        local conn
+        conn = UserInputService.InputBegan:Connect(function(inp, gameProc)
+            if gameProc then return end
+            if inp.KeyCode then
+                obj:SetValue(tostring(inp.KeyCode):gsub("Enum.KeyCode.",""))
+                conn:Disconnect()
+            end
+        end)
+    end)
+
+    -- global listener
+    UserInputService.InputBegan:Connect(function(inp, gameProc)
+        if gameProc then return end
+        if inp.KeyCode then
+            local keyName = tostring(inp.KeyCode):gsub("Enum.KeyCode.","")
+            if obj.Value == keyName then
+                Library:SafeCallback(obj._cb)
+            end
+        end
+    end)
+
+    Options[id] = obj
+    return obj
+end
+
+-- ThemeManager (kept as requested)
+local ThemeManager = {}
+do
+    ThemeManager.Folder = "CleanUI"
+    ThemeManager.Library = Library
+
+    ThemeManager.BuiltInThemes = {
+        ["Default"] = { 1, { FontColor = "#F5E1C8", MainColor = "#0F0F0F", AccentColor = "#FF8C00", BackgroundColor = "#0D0D0D", OutlineColor = "#281400" } },
+        ["BBot"] = { 2, { FontColor = "#FFFFFF", MainColor = "#1e1e1e", AccentColor = "#7e48a3", BackgroundColor = "#232323", OutlineColor = "#141414" } },
+        ["Mint"] = { 3, { FontColor = "#FFFFFF", MainColor = "#242424", AccentColor = "#3db488", BackgroundColor = "#1c1c1c", OutlineColor = "#373737" } },
+        ["Tokyo Night"] = { 4, { FontColor = "#FFFFFF", MainColor = "#191925", AccentColor = "#6759b3", BackgroundColor = "#16161f", OutlineColor = "#323232" } },
+        ["Ubuntu"] = { 5, { FontColor = "#FFFFFF", MainColor = "#3e3e3e", AccentColor = "#e2581e", BackgroundColor = "#323232", OutlineColor = "#191919" } },
+    }
+
+    local function hexToColor3(hex)
+        hex = tostring(hex):gsub("#","")
+        if #hex == 6 then
+            local r = tonumber(hex:sub(1,2),16)
+            local g = tonumber(hex:sub(3,4),16)
+            local b = tonumber(hex:sub(5,6),16)
+            if r and g and b then return Color3.fromRGB(r,g,b) end
+        end
+        return nil
+    end
+    local function color3ToHex(col)
+        if typeof(col) ~= "Color3" then return "#000000" end
+        local r,g,b = math.floor(col.R*255+0.5), math.floor(col.G*255+0.5), math.floor(col.B*255+0.5)
+        return string.format("#%02X%02X%02X", r, g, b)
+    end
+
+    function ThemeManager:ApplyTheme(name)
+        local data = nil
+        if self.BuiltInThemes[name] then
+            data = self.BuiltInThemes[name][2]
+        else
+            -- maybe custom theme: expect table with hex colors
+            data = name
+        end
+        if not data then return end
+        if data.FontColor then Library.FontColor = hexToColor3(data.FontColor) or Library.FontColor end
+        if data.MainColor then Library.MainColor = hexToColor3(data.MainColor) or Library.MainColor end
+        if data.AccentColor then Library.AccentColor = hexToColor3(data.AccentColor) or Library.AccentColor end
+        if data.BackgroundColor then Library.BackgroundColor = hexToColor3(data.BackgroundColor) or Library.BackgroundColor end
+        if data.OutlineColor then Library.OutlineColor = hexToColor3(data.OutlineColor) or Library.OutlineColor end
+
+        -- derived
+        Library.AccentColorDark = Library:GetDarkerColor(Library.AccentColor)
+        Library.AccentColorLight = Library:GetLighterColor(Library.AccentColor)
+        Library.FontColorDark = Library:GetDarkerColor(Library.FontColor)
+        Library.MainColorLight = Library:GetLighterColor(Library.MainColor)
+
+        Library:UpdateColorsUsingRegistry()
+    end
+
+    function ThemeManager:ApplyToTab(tab)
+        -- minimal integration: add a small themes section
+        if not tab or not tab.AddLeftGroupbox then return end
+        local group = tab:AddLeftGroupbox("Themes")
+        -- Build UI: color pickers for the main five colors, plus a theme dropdown
+        -- We'll create simple color pickers using Library:CreateColorPicker
+        local function makePicker(id, title, default)
+            local wrapper = Library:Create("Frame", { Parent = group.Frame, Size = UDim2.fromOffset(1, 36), BackgroundTransparency = 1 })
+            local lbl = Library:CreateLabel({ Parent = wrapper, Position = UDim2.fromOffset(8, 6), Size = UDim2.fromOffset(120, 20), Text = title, TextSize = 14 })
+            local cp = Library:CreateColorPicker(wrapper, id, { Text = title, Default = default })
+            cp:SetValueRGB(default)
+            cp:OnChanged(function(col)
+                if id == "FontColor" then Library.FontColor = col
+                elseif id == "MainColor" then Library.MainColor = col
+                elseif id == "AccentColor" then Library.AccentColor = col
+                elseif id == "BackgroundColor" then Library.BackgroundColor = col
+                elseif id == "OutlineColor" then Library.OutlineColor = col
+                end
+                ThemeManager:ApplyTheme({ FontColor = color3ToHex(Library.FontColor), MainColor = color3ToHex(Library.MainColor), AccentColor = color3ToHex(Library.AccentColor), BackgroundColor = color3ToHex(Library.BackgroundColor), OutlineColor = color3ToHex(Library.OutlineColor) })
+            end)
+        end
+
+        -- default values
+        makePicker("FontColor", "Font color", Library.FontColor)
+        makePicker("MainColor", "Main color", Library.MainColor)
+        makePicker("AccentColor", "Accent color", Library.AccentColor)
+        makePicker("BackgroundColor", "Background color", Library.BackgroundColor)
+        makePicker("OutlineColor", "Outline color", Library.OutlineColor)
+
+        -- Theme list
+        local themes = {}
+        for k,_ in pairs(self.BuiltInThemes) do table.insert(themes, k) end
+        local dd = Library:CreateDropdown(group.Frame, "ThemeManager_ThemeList", { Values = themes, Text = "Theme list", Default = themes[1] })
+        dd:OnChanged(function(val)
+            ThemeManager:ApplyTheme(val)
+        end)
+    end
+
+    function ThemeManager:SaveCustomTheme(name, themeTable)
+        -- themeTable: { FontColor="#...", MainColor="#...", ... }
+        -- We will attempt to write to file if possible; otherwise store to Library.CustomThemes
+        if type(name) ~= "string" or name:match("^%s*$") then
+            Library:Notify("Invalid theme name", 2)
+            return
+        end
+        local data = themeTable or {
+            FontColor = color3ToHex(Library.FontColor),
+            MainColor = color3ToHex(Library.MainColor),
+            AccentColor = color3ToHex(Library.AccentColor),
+            BackgroundColor = color3ToHex(Library.BackgroundColor),
+            OutlineColor = color3ToHex(Library.OutlineColor)
+        }
+        -- try to save to file (exploit env)
+        local ok, err = pcall(function()
+            if writefile and isfile and makefolder then
+                if not isfolder(ThemeManager.Folder) then
+                    makefolder(ThemeManager.Folder)
+                    makefolder(ThemeManager.Folder.."/themes")
+                end
+                local path = ThemeManager.Folder.."/themes/"..name..".json"
+                writefile(path, game:GetService("HttpService"):JSONEncode(data))
+            else
+                -- fallback: store in memory
+                Library.CustomThemes = Library.CustomThemes or {}
+                Library.CustomThemes[name] = data
+            end
+        end)
+        if not ok then warn("Failed to save theme:", err) end
+    end
+
+    function ThemeManager:LoadCustomTheme(name)
+        -- try to read from file, else from memory
+        if not name then return nil end
+        if readfile and isfile then
+            local path = ThemeManager.Folder.."/themes/"..name..".json"
+            if isfile(path) then
+                local ok, decoded = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(path)) end)
+                if ok then return decoded end
+            end
+        end
+        if Library.CustomThemes and Library.CustomThemes[name] then
+            return Library.CustomThemes[name]
+        end
+        return nil
+    end
+end
+
+Library.ThemeManager = ThemeManager
+
+-- SaveManager (kept)
+local SaveManager = {}
+do
+    SaveManager.Folder = "CleanUI"
+    SaveManager.Ignore = {}
+    SaveManager.Library = Library
+    -- parsers for types
+    SaveManager.Parser = {
+        Toggle = {
+            Save = function(idx, object) return { type = "Toggle", idx = idx, value = object.Value } end,
+            Load = function(idx, data) if Toggles[idx] then Toggles[idx]:SetValue(data.value) end end,
+        },
+        Slider = {
+            Save = function(idx, object) return { type = "Slider", idx = idx, value = tostring(object.Value) } end,
+            Load = function(idx, data) if Options[idx] then Options[idx]:SetValue(tonumber(data.value) or data.value) end end,
+        },
+        Dropdown = {
+            Save = function(idx, object) return { type = "Dropdown", idx = idx, value = object.Value } end,
+            Load = function(idx, data) if Options[idx] then Options[idx]:SetValue(data.value) end end,
+        },
+        ColorPicker = {
+            Save = function(idx, object) 
+                local hex = nil
+                if type(object.Value) == "userdata" then
+                    local c = object.Value
+                    local r,g,b = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5)
+                    hex = string.format("#%02X%02X%02X", r,g,b)
+                end
+                return { type = "ColorPicker", idx = idx, value = hex, transparency = object.Transparency }
+            end,
+            Load = function(idx, data)
+                if Options[idx] and data.value then
+                    local hex = data.value
+                    local r = tonumber(hex:sub(2,3),16)
+                    local g = tonumber(hex:sub(4,5),16)
+                    local b = tonumber(hex:sub(6,7),16)
+                    if r and g and b then
+                        Options[idx]:SetValueRGB(Color3.fromRGB(r,g,b), data.transparency)
+                    end
+                end
+            end
+        },
+        KeyPicker = {
+            Save = function(idx, object) return { type = "KeyPicker", idx = idx, mode = object.Mode, key = object.Value } end,
+            Load = function(idx, data)
+                if Options[idx] then Options[idx]:SetValue({ data.key, data.mode }) end
+            end
+        },
+        Input = {
+            Save = function(idx, object) return { type = "Input", idx = idx, text = object.Value } end,
+            Load = function(idx, data) if Options[idx] and type(data.text) == "string" then Options[idx]:SetValue(data.text) end end,
+        }
+    }
+
+    function SaveManager:SetIgnoreIndexes(list)
+        for _, key in ipairs(list) do self.Ignore[key] = true end
+    end
+
+    function SaveManager:SetFolder(folder)
+        self.Folder = folder
+        -- ensure folder exists if environment supports it
+        if makefolder and not isfolder(self.Folder) then
+            pcall(function() makefolder(self.Folder); makefolder(self.Folder.."/settings") end)
+        end
+    end
+
+    function SaveManager:Save(name)
+        if not name then return false, "no config file selected" end
+        local fullPath = self.Folder .. "/settings/" .. name .. ".json"
+        local data = { objects = {} }
+        for idx, t in pairs(Toggles) do
+            if self.Ignore[idx] then continue end
+            table.insert(data.objects, self.Parser[t.Type].Save(idx, t))
+        end
+        for idx, opt in pairs(Options) do
+            if not self.Parser[opt.Type] then continue end
+            if self.Ignore[idx] then continue end
+            table.insert(data.objects, self.Parser[opt.Type].Save(idx, opt))
+        end
+        local ok, encoded = pcall(function() return game:GetService("HttpService"):JSONEncode(data) end)
+        if not ok then return false, "encode failure" end
+        if writefile then
+            pcall(function() 
+                if not isfolder(self.Folder) then makefolder(self.Folder) end
+                if not isfolder(self.Folder.."/settings") then makefolder(self.Folder.."/settings") end
+                writefile(fullPath, encoded)
+            end)
+            return true
+        else
+            -- fallback memory store
+            Library.ConfigStore = Library.ConfigStore or {}
+            Library.ConfigStore[name] = encoded
+            return true
+        end
+    end
+
+    function SaveManager:Load(name)
+        if not name then return false, "no config file selected" end
+        local file = self.Folder .. "/settings/" .. name .. ".json"
+        local raw = nil
+        if readfile and isfile then
+            if not isfile(file) then return false, "invalid file" end
+            raw = readfile(file)
+        else
+            if not Library.ConfigStore or not Library.ConfigStore[name] then return false, "invalid file" end
+            raw = Library.ConfigStore[name]
+        end
+        local ok, decoded = pcall(function() return game:GetService("HttpService"):JSONDecode(raw) end)
+        if not ok then return false, "decode error" end
+        for _, option in ipairs(decoded.objects) do
+            if self.Parser[option.type] then
+                pcall(function() self.Parser[option.type].Load(option.idx, option) end)
+            end
+        end
+        return true
+    end
+
+    function SaveManager:Remove(name)
+        if not name then return false, "no config file selected" end
+        local file = self.Folder .. "/settings/" .. name .. ".json"
+        if readfile and isfile and delfile then
+            if not isfile(file) then return false, "invalid file" end
+            delfile(file)
+            return true
+        else
+            if Library.ConfigStore and Library.ConfigStore[name] then
+                Library.ConfigStore[name] = nil
+                return true
+            end
+            return false, "invalid file"
+        end
+    end
+
+    function SaveManager:RefreshConfigList()
+        if listfiles then
+            local list = pcall(function() return listfiles(self.Folder .. "/settings") end)
+            if not list then return {} end
+            local out = {}
+            for _, file in ipairs(list) do
+                if file:sub(-5) == ".json" then
+                    local name = file:match("([^/\\]+)%.json$")
+                    if name then table.insert(out, name) end
+                end
+            end
+            return out
+        else
+            local out = {}
+            if Library.ConfigStore then
+                for name,_ in pairs(Library.ConfigStore) do
+                    table.insert(out, name)
+                end
+            end
+            return out
+        end
+    end
+
+    function SaveManager:BuildFolderTree()
+        if makefolder then
+            pcall(function()
+                if not isfolder(self.Folder) then makefolder(self.Folder) end
+                if not isfolder(self.Folder.."/settings") then makefolder(self.Folder.."/settings") end
+            end)
+        end
+    end
+
+    function SaveManager:SetLibrary(lib) self.Library = lib end
+
+    function SaveManager:AttemptSave()
+        if self.Library then
+            -- optionally auto-save a default config name
+        end
+    end
+
+    SaveManager:BuildFolderTree()
+end
+
+Library.SaveManager = SaveManager
+
+-- ROUTINE: update colors each frame if needed (e.g., for rainbow or dynamic)
+RunService.RenderStepped:Connect(function()
+    Library:UpdateColorsUsingRegistry()
+end)
+
+-- Expose some helpers for user scripts
+return {
+    Library = Library,
+    ThemeManager = ThemeManager,
+    SaveManager = SaveManager,
+    CreateWindow = function(title, size, pos) return Library:CreateWindow(title, size, pos) end,
+    CreateToggle = function(parent, id, info) return Library:CreateToggle(parent, id, info) end,
+    CreateSlider = function(parent, id, info) return Library:CreateSlider(parent, id, info) end,
+    CreateDropdown = function(parent, id, info) return Library:CreateDropdown(parent, id, info) end,
+    CreateInput = function(parent, id, info) return Library:CreateInput(parent, id, info) end,
+    CreateColorPicker = function(parent, id, info) return Library:CreateColorPicker(parent, id, info) end,
+    CreateKeyPicker = function(parent, id, info) return Library:CreateKeyPicker(parent, id, info) end,
+}
